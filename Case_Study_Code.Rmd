@@ -1,0 +1,419 @@
+---
+title: "Case Study Code"
+author: "Tyler White, Ford Higgins, Ryan Campa, & Yiqiang Zhao"
+date: "10/6/2017"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=60),
+               tidy=TRUE, 
+               echo = TRUE)
+library(tidyverse, quietly = T)
+library(glmnet, quietly = T)
+library(faraway, quietly = T)
+library(MASS, quietly = T)
+```
+
+
+# Explanatory
+
+Note: We are using the tidyverse, glmnet, faraway, and MASS packages in our code. 
+```{r Explanatory Code}
+
+# Used for ExterQual, ExterCond, BsmtQual, BsmtCond, 
+#         HeatingQC, KitchenQual, FireplaceQu, GarageQual, GarageCond
+#         PoolQC
+# Reasonable because rating can be continous
+rating5 <- function(values) {
+  lapply(values, function(value) switch(value,
+                                        "Ex" = 5,
+                                        "Gd" = 4,
+                                        "TA" = 3,
+                                        "Fa" = 2,
+                                        "Po" = 1,
+                                        "NA" = 0)) %>% unlist()
+}
+
+MSPE <- function(predictY, X_test, Y_test) mean((Y_test - predictY(X_test)) ^ 2)
+
+clean.up <- function(data) {
+  data$MSSubClass <- as.character(data$MSSubClass) # MSSubClass should be categorical
+  
+  r5Vars <- c("ExterQual", "ExterCond", "BsmtQual", "BsmtCond", 
+              "HeatingQC", "KitchenQual", "FireplaceQu", "GarageQual", "GarageCond",
+              "PoolQC")
+  data$GarageCars[is.na(data$GarageCars)] <- 0
+  
+  data[r5Vars] <- lapply(data[r5Vars],rating5)
+  data$CentralAir <- data$CentralAir == "Y"
+  data$MasVnrArea[which(is.na(data$MasVnrArea))] <- 0
+  data$MasVnrType[which(is.na(data$MasVnrType))] <- "None"
+  
+  lot_lm <- lm(LotFrontage ~ LotArea, data = data)
+  lotF_nas <- data.frame(LotArea = data$LotArea[is.na(data$LotFrontage)])
+  data$LotFrontage[is.na(data$LotFrontage)] <- predict(lot_lm, newdata = lotF_nas)
+  data$LotFrontage <- as.integer(round(data$LotFrontage))
+  
+  data[is.na(data)] <- "NA"
+  data <- data %>% 
+    dplyr::select(-Id,-Utilities, -Alley, -Fence, -MiscFeature, -Exterior2nd,
+           -FireplaceQu, -PoolQC, -RoofMatl, -GarageYrBlt, -MSZoning, -SaleType) %>% 
+    na.omit()
+  
+  return(data)
+}
+
+# Does lasso regression and returns the important variables
+getLassoVars <- function(X, Y, alpha = 1) {
+  grid.lambda <- 10^seq(10,-2, length=100)
+  
+  cv.out <- cv.glmnet(X, Y, alpha = alpha, lambda = grid.lambda)
+  
+  best.lambda <- cv.out$lambda.min
+  final.model <- glmnet(X, Y, alpha = alpha, lambda = best.lambda)
+  betas <- coef(final.model)[2:nrow(coef(final.model)),]
+  
+  ids <- which(betas > 1e-10)
+  ids <- ids[2:length(ids)]
+  return(list(vars = ids, final.model = final.model))
+}
+
+# Performs OLS and removes outliers and leverage points
+getOLS <- function(X, Y) {
+  fit1 <- lm(Y ~ ., data = X)
+  jack <- rstudent(fit1)
+  crit <- qt(1 - .05/(2 * nrow(X)), nrow(X) - ncol(X) - 1)
+  outliers <- which(abs(jack) > crit)
+  
+  df <- dffits(fit1)
+  
+  # Remove the outliers
+  remove.influence.points <- abs(df) < 4 * sqrt(ncol(X) / nrow(X))
+  
+  Y_sub <- Y[(-outliers)][remove.influence.points]
+  X_sub <- X[(-outliers),][remove.influence.points,]
+  
+  fit2 <- lm(Y_sub ~ ., X_sub)
+  fit2
+}
+
+# Functions used for transformation
+powerLaw <- function(y, lambda) (y ^ lambda - 1) / lambda
+inverseLaw <- function(z, lambda) (lambda * z + 1) ^ (1 / lambda)
+
+# Takes a data matrix and finds the closest center
+closest.cluster <- function(kmeans.list, X) {
+  X <- as.matrix(X)
+  closest <- as.integer(rep(NA, nrow(X)))
+  for(i in 1:nrow(X)) {
+    row <- X[i,]
+    closest[i] <- which.min(apply((t(kmeans.list$centers) - row)^2, 2, sum))
+  }
+  
+  return(closest)
+}
+
+testData <- function(train.x, train.y, test.x, test.y) {
+  # Box-Cox transformation constant
+  lambda <- 1/4
+  
+  # Determine outliers in train.x using kmeans
+  cls <- kmeans(train.x, 3)
+  big.group <- which.max(table(cls$cluster))
+  
+  # split training into outliers and non-outliers
+  good.train.x <- as.data.frame(train.x[which(cls$cluster==big.group),])
+  good.train.y <- train.y[which(cls$cluster==big.group)]
+  bad.train.y <- train.y[which(cls$cluster!=big.group)]
+  
+  # Run lasso for variable selection
+  lasso.info <- getLassoVars(as.matrix(good.train.x), powerLaw(good.train.y, lambda))
+  vars.to.keep <- lasso.info$vars
+  
+  # Run OLS that removes more outliers and influential points
+  ols.fit <- getOLS(good.train.x[,vars.to.keep], powerLaw(good.train.y, lambda))
+  predict.good <- function(new.x) inverseLaw(predict(ols.fit, new.x), lambda)
+  predict.bad <- function(new.x) mean(bad.train.y)
+  
+  # Split test data into outliers and non-outliers
+  in.main.group.test <- closest.cluster(cls, test.x) == big.group
+  good.test.x <- as.data.frame(test.x[in.main.group.test, ])
+  good.test.y <- test.y[in.main.group.test]
+  
+  bad.test.x <- as.data.frame(test.x[!in.main.group.test, ])
+  bad.test.y <- test.y[!in.main.group.test]
+  
+  # Get the mspe for each category and how many points are outliers
+  good.mspe <- MSPE(predict.good, good.test.x, good.test.y)
+  bad.mspe <- MSPE(predict.bad, good.test.y, bad.test.y)
+  bad.test.rate <- sum(!in.main.group.test) / length(in.main.group.test)
+  combined.mspe <- (sum(in.main.group.test) * good.mspe + 
+                      sum(!in.main.group.test) * bad.mspe) / length(in.main.group.test)
+  
+  # Return list of information that is useful.
+  list(fit = ols.fit, good.mspe = good.mspe, 
+       bad.mspe = bad.mspe, bad.test.rate = bad.test.rate, 
+       combined.mspe = combined.mspe, vars.kept = vars.to.keep,
+       kmeans.list = cls, outlier.mean = mean(bad.train.y))
+}
+
+predictNew <- function(train.output, new.x) {
+  main.group <- which.max(table(train.output$kmeans.list$cluster))
+  is.outlier <- closest.cluster(train.output$kmeans.list, new.x) != main.group
+  
+  new.y <- inverseLaw(predict(fit, new.x, interval = 'conf'), 1/4)
+  new.y[is.outlier] <- train.output$outlier.mean
+  
+  list(predicted.y = new.y, is.outlier = is.outlier, 
+       bad.rate = sum(is.outlier) / length(is.outlier))
+}
+
+data <- read_csv("/Users/fordhiggins/Desktop/msan_files/msan601/housing.txt", 
+                 col_types = cols())
+data <- clean.up(data)
+
+X <- model.matrix(SalePrice ~ ., data)
+Y <- data$SalePrice
+
+# Setup training and test data
+train <- sample(1:floor(nrow(X) * .50))
+X_train <- X[train, ]
+Y_train <- data$SalePrice[train]
+
+X_test <- X[(-train), ]
+Y_test <- data$SalePrice[(-train)]
+
+# Run model
+output <- testData(X_train, Y_train, X_test, Y_test)
+
+fit <- output$fit
+fit_sum <- summary(fit)
+print(paste("R squared:", fit_sum$r.squared))
+
+b <- fit_sum$coefficients
+b <- data.frame(names = rownames(b), b)
+b <- b %>% filter(Pr...t.. < 0.05) %>% arrange(Estimate)
+
+new.data <- read_csv("/Users/fordhiggins/Desktop/msan_files/msan601/Morty.txt", 
+                     col_types = cols())
+clean.data <- clean.up(new.data)
+M1 <- dplyr::bind_rows(data, clean.data)
+M2 <- model.matrix(SalePrice ~ ., M1)
+new.data <- as.data.frame(t(M2[nrow(M2):(nrow(M2) + nrow(clean.data) - 1),]))
+
+morty_prediction <- predictNew(output, new.data) 
+
+```
+
+
+# Prediction
+
+## 1. Data Cleaning and Selection
+```{r Prediction}
+# Import the data set
+house_data <- read_csv("/Users/fordhiggins/Desktop/msan_files/msan601/housing.csv", col_types = cols())
+
+# Based on summary statistics and the codebook, we decided to drop these varibales
+house_data['Alley'] = NULL
+house_data['PoolQC'] = NULL
+house_data['Fence'] = NULL
+house_data['MiscFeature'] = NULL
+house_data['Id'] = NULL
+house_data[c('Utilities')] = NULL 
+# Assumption that if there is no lotfrontage, make it 0
+house_data$LotFrontage[is.na(house_data$LotFrontage)] <- 0
+# If there is NA garage, change to none... do so for all garage parameters 
+# GarageType GarageYrBlt GarageFinish   GarageCars  GarageArea  GarageQual  GarageCond
+house_data$GarageType[is.na(house_data$GarageType)] <- "None"
+house_data$GarageYrBlt <- NULL
+house_data$GarageFinish[is.na(house_data$GarageFinish)] <- "None"
+house_data$GarageCars[is.na(house_data$GarageCars)] <- "None"
+house_data$GarageArea[is.na(house_data$GarageArea)] <- 0
+# house_data$GarageArea <- NULL
+house_data$GarageQual[is.na(house_data$GarageQual)] <- "None"
+house_data$GarageCond[is.na(house_data$GarageCond)] <- "None"
+house_data$FireplaceQu[is.na(house_data$FireplaceQu)] <- "None"
+# Getting rid of the basement stuff
+house_data$BsmtQual[is.na(house_data$BsmtQual)] <- "None"
+house_data$BsmtCond[is.na(house_data$BsmtCond)] <- "None"
+house_data$BsmtExposure[is.na(house_data$BsmtExposure)] <- "None"
+house_data$BsmtFinType1[is.na(house_data$BsmtFinType1)] <- "None"
+house_data$BsmtFinType2[is.na(house_data$BsmtFinType2)] <- "None"
+house_data$MasVnrType[is.na(house_data$MasVnrType)] <- "None"
+# WAS 0 before
+house_data$MasVnrArea[is.na(house_data$MasVnrArea)] <- 0
+house_data$MSSubClass <- as.factor(house_data$MSSubClass)
+house_data$MSZoning <- as.factor(house_data$MSZoning)
+# Remove this data point because it has NA electrical breaker.
+temp1 <- house_data[-1380,]
+
+# Function used to create new features
+feature_builder <- function(feature1, feature2, df, threshold = 12) {
+  cloned_df <- as.data.frame(df)
+  temp_table <- table(unlist(cloned_df[paste0(feature1)]), 
+                      unlist(cloned_df[paste0(feature2)]))
+  column_names <- colnames(temp_table)
+  row_names <- rownames(temp_table)
+  #for each row in the temp table:
+  for(i in 1:nrow(temp_table)) {
+    current_row_name <-  row_names[i]
+    current_row <- temp_table[i,]
+    for(j in 1:ncol(temp_table)){
+      current_col_name <-  column_names[j]
+      val <-  current_row[j]
+      if(val > threshold || val/(sum(current_row) + 1) >= 1/2) {
+        new_col_name <-  paste0(current_row_name,current_col_name)
+        cloned_df[, new_col_name] <- 0
+      } 
+    }
+  }
+  for(i in 1:nrow(cloned_df)){
+    current_row <- cloned_df[i,]
+    feat1 <- current_row[feature1]
+    feat2 <- current_row[feature2]
+    test_col <- paste0(feat1,feat2)
+    if(test_col %in% colnames(cloned_df)){
+      cloned_df[i, test_col] <- 1
+    }
+  }
+  return(cloned_df)
+}
+
+#cross validation MSPE 
+cv_mspe <- function(alpha, xdata, ydata, time = 5, seed = 1, boxcox = 2/9){
+    set.seed(seed)
+    xdata <- xdata[sample(1:dim(xdata)[1], dim(xdata)[1], F),]
+    set.seed(seed)
+    ydata <- ydata[sample(1:length(ydata), length(ydata), F)]
+    # split (time)s data set
+    group <-  rep_len(1:time, dim(xdata)[1])
+    grid.lambda <- 10^seq(10, -2, length = 100)
+    mspe.combined <- c()
+    mspe.good <- c()
+    mspe.bad <- c()
+    
+
+    
+  if(alpha <= 1){
+    for(i in 1:time){
+      heldoutX <- xdata[group == i, ]
+      heldoutY <- ydata[group == i]
+      trainX <- xdata[group != i, ]
+      trainY <- ydata[group != i]
+        
+      clstrainX <- kmeans(as.data.frame(trainX), 3)
+      big.group <- which.max(table(clstrainX$cluster))
+      X.train.sub <- trainX[which(big.group==clstrainX$cluster), ]
+      Y.train.sub <- trainY[which(big.group==clstrainX$cluster)]
+      
+      #good data points in test dataset
+      out <- as.logical(rep(F, nrow(heldoutX)))
+      for(i in 1:nrow(heldoutX)) {
+      row <- as.matrix(heldoutX)[i,]
+      closest <- which.min(apply((t(clstrainX$centers) - row)^2, 2, sum))
+      out[i] <- closest == big.group
+      }
+      
+      model.train <- glmnet(X.train.sub, powerLaw(Y.train.sub, boxcox), 
+                            alpha = alpha, lambda = grid.lambda)
+      set.seed(seed)
+      cv.out <- cv.glmnet(X.train.sub, powerLaw(Y.train.sub, boxcox), 
+                          alpha = alpha)
+      best.lambda <- cv.out$lambda.min
+      pred <- inverseLaw(predict(model.train, s = best.lambda, 
+                                 newx = heldoutX[out, ]), boxcox)
+      mspe.good <- c(mspe.good, mean((pred - heldoutY[out])^2))
+      mspe.combined <- c(mspe.combined, mean((pred - heldoutY[out])^2)*sum(out)/length(out) +
+                           sum(!out)/length(out)*mean((heldoutY[!out] - mean(heldoutY[!out]))^2))
+      mspe.bad <- c(mspe.bad, mean((heldoutY[!out] - mean(heldoutY[!out]))^2))
+      
+    }
+  }
+  list('good mspe' = mean(mspe.good),'bad mspe' = mean(mspe.bad), 'combined mspe' = mean(mspe.combined))
+ 
+}
+
+# Create category combinations of these pairs of variables.
+house_data_no_na <- feature_builder("Neighborhood", "BldgType", temp1)
+house_data_no_na <- feature_builder("Neighborhood", "HouseStyle", house_data_no_na)
+house_data_no_na <- feature_builder("BldgType", "HouseStyle", house_data_no_na)
+house_data_no_na <- feature_builder("Neighborhood", "SaleCondition", house_data_no_na)
+house_data_no_na <- feature_builder("SaleType", "SaleCondition", house_data_no_na)
+house_data_no_na <- feature_builder("HouseStyle", "SaleCondition", house_data_no_na)
+house_data_no_na <- feature_builder("LotConfig", "Neighborhood", house_data_no_na)
+house_data_no_na <- feature_builder("Exterior1st", "Exterior2nd", house_data_no_na)
+house_data_no_na <- feature_builder("Neighborhood", "Condition1", house_data_no_na)
+```
+
+```{r}
+# split the data into training data and test data
+set.seed(11)
+test <- sample(1:nrow(house_data_no_na), size=nrow(house_data_no_na)/3, replace = F)
+train <- -test
+
+x <- model.matrix(SalePrice ~ ., data = house_data_no_na)
+y <- house_data_no_na$SalePrice
+
+# train data set
+train.x <-  x[train,]
+train.y <- y[train]
+
+# test data set
+test.x <- x[test,]
+test.y <- y[test]
+```
+
+```{r}
+# OUTLIER DETECTION
+# perform k-means on the train set:
+set.seed(11)
+cls <- kmeans(as.data.frame(train.x), 3)
+big.group <- which.max(table(cls$cluster))
+# subset of the cluster
+X_sub <- train.x[which(cls$cluster==big.group),]
+# corresponding y of the X subset 
+Y_sub <-  train.y[which(cls$cluster==big.group)]
+
+# good data points in test dataset
+out <- as.logical(rep(F, nrow(test.x)))
+
+for(i in 1:nrow(test.x)) {
+  row <- as.matrix(test.x)[i,]
+  closest <- which.min(apply((t(cls$centers) - row)^2, 2, sum))
+  out[i] <- closest == big.group
+}
+```
+
+## 2. Model
+The Predictive Model does the following to train the model:  
+1) Use k-means method to determine the X outlier groups  
+2) Use Box-Cox transformation with $\lambda = \frac{2}{9}$  
+3) Use LASSO, Ridge, and Elastic-Net with alphas of 0.25, 0.5, 0.75  
+
+```{r Box-Cox Transformations}
+# Box-Cox Y transformation
+powerLaw <- function(y, lambda) (y ^ lambda - 1) / lambda
+# Box-Cox Y retransformation
+inverseLaw <- function(z, lambda) (lambda * z + 1) ^ (1 / lambda)
+# Show the plot of the estimate value of lambda
+MASS::boxcox(train.y ~., data = as.data.frame(train.x))
+```
+
+```{r}
+#RIDGE
+cv_mspe(0,x,y,time = 5, seed = 10)
+
+#LASSO
+cv_mspe(1,x,y,time = 5, seed = 10)
+
+#Elastic Net with alpha 0.5
+cv_mspe(0.5,x,y,time = 5, seed = 10)
+
+#Elastic Net with alpha 0.25
+cv_mspe(0.25,x,y,time = 5, seed = 10)
+
+#Elastic Net with alpha 0.75
+cv_mspe(0.75,x,y,time = 5, seed = 10)
+```
